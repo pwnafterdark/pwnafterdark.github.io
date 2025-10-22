@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>updates</title>
+</head>
+<body>
+
+<h1>updates (<a href="./index.html">home</a>)</h1>
+
+<h2> 22-10-2025 </h2>
+<p>
+I've spent a few hours looking at the todo challenge, but I can't seem to make any progress on the challenge.
+There's a 'vulnerability' (it's really just bad coding practice) where users can keep creating notes in the same index, which is a memory leak.
+There does't seem to be any UAFs, or OOBs, so I'm mostly focusing on the arb file read/write, which can be exploited by writing to the note at index 8.
+The flag can be loaded into an automatic buffer, but file parsing code prevents it from being stored in static or heap memory.
+I'll keep persisting with this challenge, and if you have any hints, please do email me :D
+</p>
+
+<p>
+I've been looking to get into Verilog so I can start programatically designing ciruits.
+I know Cadence has resource for starting out, so I'll give those a shot.
+Surely there's some good textbooks for me to learn from too, but I really need to get my hands on a Raspberry Pi or something so I can start revising my embedded programming skills.
+</p>
+
+<p>
+I haven't made much progress on 'The Art of Electronics', because this CTF problem has consumed me. So much so that I end up working until midnight, leaving no time for the gym (or dinner).
+Anyways, I've seen some discussion on Twitter about using XOR or MOV instructions to exchange two variables. I've done some rudimentary experiments, and MOV seems to be the clear winner. I'll have to investigate this further, but it's something I've pushed onto the back-burner
+</p>
+
+</body>
+</html>
+
