@@ -7,6 +7,75 @@
 
 <h1>updates (<a href="./index.html">home</a>)</h1>
 
+<h2> 2025-10-29 </h2>
+<p>
+I've spent a few more hours looking into 'todo'. Theoretically, I have a 15 byte OOB write into a calloc'd buffer, but only the last 7 of those bytes can corrupt the meta-data of the next chunk. The binary also has full relro protections, so I'm not sure how to exploit it? There are house techniques that can get me a WRITE-WHAT-WHERE primitive (I think), but then what?
+</p>
+
+<p>
+I've found <a href="https://nguendung.github.io/posts/otw-protections-and-bypass-101/">this</a> cool website by SuiiKawaii, who suggests using,
+<ul>
+        <li>.fini_array/.init_array (if writable in the target, not always).</li>
+        <li>Function pointers / vtables / callback tables in .data/heap.</li>
+        <li>ret2dlresolve: forge relocation and let the dynamic loader resolve system.</li>
+</ul>
+
+But I'll have to keep researching more into these techniques. Hopefully there's something easier...
+</p>
+
+<p>
+I've skimmed to chapter 5 in 'Verilog HDL', and it's not too bad! I think it'll take some time to get over just writing test-cases, and not having the GUI that something like Digital provides. That's OK, I'm an adult now. Anyways, I've 'made' my first SR-latch (I didn't really make it, the book just gives the code),
+
+<pre>
+<code>
+/* SR latch */
+module SR_latch(Q, Qbar, Sbar, Rbar);
+
+output Q, Qbar;
+input Sbar, Rbar;
+
+nand n1(Q, Sbar, Qbar);
+nand n2(Qbar, Rbar, Q);
+
+endmodule
+
+/* stimulus */
+module Top;
+
+wire q, qbar;
+reg set, reset;
+
+SR_latch m1(q, qbar, ~set, ~reset);
+
+initial
+begin
+        $monitor($time, " set = %b, reset = %b, q = %b, qbar = %b\n", set, reset, q, qbar);
+        set = 0;
+        reset = 0;
+        #5 reset = 1;
+        #5 reset = 0;
+        #5 set = 1;
+end
+
+endmodule
+</code>
+</pre>
+
+Cool, I think I should be ready to start making all of the basic components for a CPU. Just off the top of my head,
+<ul>
+        <li>multiplexers</li>
+        <li>latches (going until D-flipflop with enable bit)</li>
+        <li>registers</li>
+        <li>adders</li>
+</ul>
+
+And so on.
+</p>
+
+<p>
+Sheesh! "The Art of Electronics" is a massive book. Normally, I wouldn't read something like this so rigourously. I'd just skim some chapters then give myself a project to work on. I don't know how to do that for electronics, but I'll have to figure something out. I mean, reading isn't bad per-say, it's just starting to feel a bit bookish :(. But, I did learn about Thevenin equivalent circuits :D
+</p>
+
 <h2> 2025-10-27 </h2>
 <p>
 It turns out I'm dumber than I thought I was. After reading <em>just the first line</em> of <a href="robbert1978.github.io/2025/03/28/2025-3-29-CodeGate-2025-Quals/index.html">this</a> solution to the 'todo' CTF challenge, it's so obvious that file-parsing logic can be broken by embedding tokens into your note. Anyways, if you put a <code>||</code> in the title of your node, then you have an OOB write in the description buffer. Maybe there's a stronger primitive... I don't know since I literally just read the first line of the solution.
