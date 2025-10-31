@@ -7,6 +7,11 @@
 
 <h1>updates (<a href="./index.html">home</a>)</h1>
 
+<h2> 2025-11-01 </h2>
+<p>
+I had a look at the solution for "todo"... Yeah I wasn't getting that. Damn I suck. I wonder how long I should spend attempting problems before looking at the solutions. Anyways, I'll just go through the solution and see if I understand it :((
+</p>
+
 <h2> 2025-10-29 </h2>
 <p>
 I've spent a few more hours looking into 'todo'. Theoretically, I have a 15 byte OOB write into a calloc'd buffer, but only the last 7 of those bytes can corrupt the meta-data of the next chunk. The binary also has full relro protections, so I'm not sure how to exploit it? There are house techniques that can get me a WRITE-WHAT-WHERE primitive (I think), but then what?
