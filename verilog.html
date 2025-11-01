@@ -1,0 +1,72 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>baby_kernel write-up</title>
+</head>
+<body>
+
+        <h1>learning verilog(<a href="./index.html">home</a>)</h1>
+
+<h1>Introduction</h1>
+<p>
+Here's my verilog journey!
+</p>
+
+<blockquote> Big things have small beginnings -- T.E Lawrence </blockquote>
+
+<h2> 2-1 Multiplexer </h2>
+<p>
+Here we have the humble 2-1 multiplexer. It takes two inputs, and outputs one of these inputs depending on a selector bit. 
+</p>
+
+<pre>
+<code>
+module mux(I_0, I_1, sel, out);
+
+       output out;
+       input I_0, I_1, sel;
+
+       wire sel_I_0, sel_I_1;
+
+       and n1(sel_I_0, sel, I_0);
+
+       and n2(sel_I_1, ~sel, I_1);
+
+       or n3(out, sel_I_0, sel_I_1);
+
+endmodule
+
+module Top;
+        reg I_0, I_1, sel;
+        wire out;
+
+        mux m(I_0, I_1, sel, out);
+        initial
+        begin
+                $monitor($time, " out = %b, sel = %b, I_0 = %b, I_1 = %b\n",out, sel, I_0, I_1);
+                sel = 0;
+                I_0 = 0;
+                I_1 = 0;
+
+                #1 sel = 0;
+
+                #1 I_0 = 1;
+                #1 sel = 0;
+
+                #1 I_1 = 0;
+                #1 sel = 1;
+
+                #1 I_1 = 1;
+                #1 sel = 1;
+
+        end
+
+endmodule
+</code>
+</pre>
+
+
+</body>
+</html>
+
