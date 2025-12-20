@@ -305,7 +305,7 @@ The description of the function is honestly enough to understand it. Pretty much
 
 <p>
 Anyways, you might be wondering why we can't just splice an important file like <code>/etc/passwd</code> into the pipe, and then overwrite it by entering data into the write end of the pipe?
-Good question! It all comes down to that pesky <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag. Notice in the above code that the initialisation of <code>buf</code> in <code>splice_folio_into_pipe</code> will set the <code>flags</code> member in the struct to 0, despite it noe being literally written out. Alright, let's look at what happens if you try overwriting the file!
+Good question! It all comes down to that pesky <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag. Notice in the above code that the initialisation of <code>buf</code> in <code>splice_folio_into_pipe</code> will set the <code>flags</code> member in the struct to 0, despite it not being literally written out. Alright, let's look at what happens if you try overwriting the file!
 </p>
 
 <p>
@@ -405,7 +405,7 @@ chars = total_len & (PAGE_SIZE-1);
 </code>
 </pre>
 
-Take some time to understand the code. I've put the important bits above. Prety much, if the pipe has the <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag set, it <em>will</em> start writing directly into the page cache entry! That flag pretty much ensures that you start writing <em>exactly</em> where your left on the pipe. The 'cursor' of the pipe will smoothly scan over the pipe pages. Unfortunately, the flag is 0 as I previously said. So, what ends up happening is that the write contents will go into a <em>new</em> page, and we don't end up overwriting our page-cache page data :(
+Take some time to understand the code. I've put the important bits above. Pretty much, if the pipe has the <code>PIPE_BUF_FLAG_CAN_MERGE</code> flag set, it <em>will</em> start writing directly into the page cache entry! That flag pretty much ensures that you start writing <em>exactly</em> where your left on the pipe. The 'cursor' of the pipe will smoothly scan over the pipe pages. Unfortunately, the flag is 0 as I previously said. So, what ends up happening is that the write contents will go into a <em>new</em> page, and we don't end up overwriting our page-cache page data :(
 </p>
 
 <p>
@@ -413,7 +413,7 @@ However, we do have that UAF write :D So, what we can do is this:
 <ol>
         <li> Create a pipe </li>
         <li> Splice a single byte of out target file into the pipe to bring its page cache entry into the pipe buffer </li>
-        <li> Corrupt the flags member of the pipe buffer to be equal to <code>PIPE_BUF_FLAG_CAN_MERGE </li>
+        <li> Corrupt the flags member of the pipe buffer to be equal to <code>PIPE_BUF_FLAG_CAN_MERGE</code> </li>
         <li> Overwrite the file contents by using the <code>write</code> system call on the pipe </li>
 </ol>
 </p>
