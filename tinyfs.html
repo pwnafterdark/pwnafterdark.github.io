@@ -231,6 +231,10 @@ Ideally, I want to allocate pagetables, and by extension, PTEs, for a the highly
 All we have to do now is <code>mmap</code> the passwd file at an address alligned to 0x2000000, and hope it falls into out UAFd page. We then just have to ensure that the R/W bit in the PTE is set to 1, and we can then write to the page!
 </p>
 
+<p>
+I got all of this information from <a href="https://sam4k.com/page-table-kernel-exploitation/">sam4k</a> btw.
+</p>
+
 <h1>Exploit Code</h1>
 <pre>
 <code>
@@ -574,7 +578,7 @@ The exploit is extremely, and embarressingly unreliable. You may have to run it 
 </p>
 
 <p>
-For some reason, I didn't have to flush the tlb to get the corrupted page mappings
+For some reason, I didn't have to flush the tlb to get the corrupted page mappings. Also, spraying a single pte seemed to work.
 </p>
 
 <p>
